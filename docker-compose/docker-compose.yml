@@ -22,7 +22,7 @@ services:
     restart: always
 
   grafana:
-    image: grafana/grafana:12.0.2
+    image: grafana/grafana:12.4.4
     volumes:
       - ./datasource.yml:/etc/grafana/provisioning/datasources/prometheus.yml
       - ./dashboard.yml:/etc/grafana/provisioning/dashboards/dashboard.yml
