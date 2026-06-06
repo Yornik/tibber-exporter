@@ -126,6 +126,23 @@ type Prices struct {
 	}
 }
 
+// PricesQuarterHourly is the same query as Prices but requests 15-minute
+// (quarter-hourly) price resolution via priceInfo(resolution: QUARTER_HOURLY).
+// Not every home/market supports it, so callers fall back to Prices on error.
+type PricesQuarterHourly struct {
+	Viewer struct {
+		Home struct {
+			CurrentSubscription struct {
+				PriceInfo struct {
+					Current  Price
+					Today    []Price
+					Tomorrow []Price
+				} `graphql:"priceInfo(resolution: QUARTER_HOURLY)"`
+			}
+		} `graphql:"home(id: $id)"`
+	}
+}
+
 type LiveMeasurement struct {
 	Timestamp               time.Time
 	Power                   float64

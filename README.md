@@ -1,5 +1,13 @@
 # Tibber exporter
 
+> **Fork note.** This is a fork of [terjesannum/tibber-exporter](https://github.com/terjesannum/tibber-exporter)
+> that adds **15-minute (quarter-hourly) electricity price resolution**: `UpdatePrices`
+> queries `priceInfo(resolution: QUARTER_HOURLY)` and transparently falls back to the
+> upstream hourly query if a home/market doesn't support it. Metrics are unchanged.
+> Images are published to `ghcr.io/yornik/tibber-exporter` with semver tags (CI in
+> `.github/workflows/ci.yaml`); the upstream chart/binary release pipeline is dropped.
+> Everything else tracks upstream — please send general fixes there.
+
 Monitor your power usage and costs with Prometheus and Grafana.
 
 ![Grafana dashboard](grafana/dashboard.png)

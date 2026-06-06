@@ -39,16 +39,23 @@ func New(id graphql.ID) *Home {
 }
 
 func (h *Home) UpdatePrices(ctx context.Context, client *graphql.Client) {
-	var prices tibber.Prices
 	log.Printf("Updating prices for %v\n", h.Id)
-	err := client.Query(ctx, &prices, map[string]interface{}{
-		"id": h.Id,
-	})
-	if err != nil {
-		log.Println(err)
+	// Prefer 15-minute (quarter-hourly) price resolution. Not every home or
+	// market supports it, so fall back to the default hourly query on error.
+	var qh tibber.PricesQuarterHourly
+	if err := client.Query(ctx, &qh, map[string]interface{}{"id": h.Id}); err != nil {
+		log.Printf("Quarter-hourly price query failed for %v, falling back to hourly: %v\n", h.Id, err)
+		var prices tibber.Prices
+		if err := client.Query(ctx, &prices, map[string]interface{}{"id": h.Id}); err != nil {
+			log.Println(err)
+			return
+		}
+		h.Prices = prices
 		return
 	}
-	h.Prices = prices
+	h.Prices.Viewer.Home.CurrentSubscription.PriceInfo.Current = qh.Viewer.Home.CurrentSubscription.PriceInfo.Current
+	h.Prices.Viewer.Home.CurrentSubscription.PriceInfo.Today = qh.Viewer.Home.CurrentSubscription.PriceInfo.Today
+	h.Prices.Viewer.Home.CurrentSubscription.PriceInfo.Tomorrow = qh.Viewer.Home.CurrentSubscription.PriceInfo.Tomorrow
 }
 
 func (h *Home) GetPricesHandler(w http.ResponseWriter, r *http.Request) {
