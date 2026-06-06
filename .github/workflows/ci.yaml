@@ -63,7 +63,7 @@ jobs:
           push: true
           provenance: false
           tags: |
-            ghcr.io/${{ github.repository_owner }}/tibber-exporter:${{ github.ref_name }}
-            ghcr.io/${{ github.repository_owner }}/tibber-exporter:latest
+            ghcr.io/yornik/tibber-exporter:${{ github.ref_name }}
+            ghcr.io/yornik/tibber-exporter:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
