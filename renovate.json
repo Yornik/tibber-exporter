@@ -36,5 +36,8 @@
     }
   ],
   "semanticCommits": "enabled",
-  "semanticCommitType": "fix"
+  "semanticCommitType": "fix",
+  "ignorePaths": [
+    "docker-compose/**"
+  ]
 }
