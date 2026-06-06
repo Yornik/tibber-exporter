@@ -34,5 +34,7 @@
       ],
       "automerge": true
     }
-  ]
+  ],
+  "semanticCommits": "enabled",
+  "semanticCommitType": "fix"
 }
