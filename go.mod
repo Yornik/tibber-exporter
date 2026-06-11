@@ -6,7 +6,7 @@ require (
 	github.com/hasura/go-graphql-client v0.16.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/common v0.68.1
-	golang.org/x/exp v0.0.0-20260603202125-055de637280b
+	golang.org/x/exp v0.0.0-20260611194520-c48552f49976
 )
 
 require (
