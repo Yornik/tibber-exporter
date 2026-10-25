@@ -140,15 +140,23 @@ func (h *Home) UpdatePrevious(ctx context.Context, client *graphql.Client, res t
 	}
 }
 
-func (h *Home) SubscribeMeasurements(ctx context.Context, hc *http.Client, wsUrl string, token string) {
-	log.Printf("Creating measurements subscription for home %v\n", h.Id)
+// newSubscriber returns a client for the live feed. It logs the protocol
+// messages, except connection_init: that message carries the API token.
+func newSubscriber(wsUrl string, hc *http.Client, token string) *graphql.SubscriptionClient {
 	subscriber := graphql.NewSubscriptionClient(wsUrl)
 	subscriber.WithProtocol(graphql.GraphQLWS)
 	subscriber.WithConnectionParams(map[string]interface{}{"token": token})
 	subscriber.WithSyncMode(true)
 	subscriber.WithLog(log.Println)
+	subscriber.WithoutLogTypes(graphql.GQLConnectionInit)
 	subscriber.WithRetryTimeout(time.Second * 5)
 	subscriber.WithWebSocketOptions(graphql.WebsocketOptions{HTTPClient: hc})
+	return subscriber
+}
+
+func (h *Home) SubscribeMeasurements(ctx context.Context, hc *http.Client, wsUrl string, token string) {
+	log.Printf("Creating measurements subscription for home %v\n", h.Id)
+	subscriber := newSubscriber(wsUrl, hc, token)
 	subscriber.OnConnected(func() {
 		log.Printf("Measurements subscription for home %v connected\n", h.Id)
 	})
@@ -172,6 +180,9 @@ func (h *Home) SubscribeMeasurements(ctx context.Context, hc *http.Client, wsUrl
 			"id": h.Id,
 		},
 		func(dataValue []byte, errValue error) error {
+			if errValue != nil {
+				log.Printf("Subscription error for home %v: %v\n", h.Id, errValue)
+			}
 			var m Measurements
 			err := json.Unmarshal(dataValue, &m)
 			if err != nil {
