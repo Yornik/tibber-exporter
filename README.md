@@ -3,7 +3,8 @@
 > **Fork note.** This is a fork of [terjesannum/tibber-exporter](https://github.com/terjesannum/tibber-exporter)
 > that adds **15-minute (quarter-hourly) electricity price resolution**: `UpdatePrices`
 > queries `priceInfo(resolution: QUARTER_HOURLY)` and transparently falls back to the
-> upstream hourly query if a home/market doesn't support it. Metrics are unchanged.
+> upstream hourly query if a home/market doesn't support it. It also keeps running when
+> the live feed fails, instead of exiting (see [Live feed](#live-feed)).
 > Images are published to `ghcr.io/yornik/tibber-exporter` with semver tags (CI in
 > `.github/workflows/ci.yaml`); the upstream chart/binary release pipeline is dropped.
 > Everything else tracks upstream — please send general fixes there.
@@ -54,9 +55,46 @@ Prebuilt binaries for Linux, MacOS and Windows are available on the [release pag
 
 A `TIBBER_TOKEN` is required to use the Tibber API, go to [developer.tibber.com](https://developer.tibber.com/) to find yours.
 
-Regardless of how you run this program, it is important to run it with an automatic restart mechanism. If the live feed from Tibber for some reason is interrupted or not available, the program will take a short pause and exit. The pause is to avoid a restart loop and trigger rate limiting in the Tibber API, and just exiting and restarting is better than trying to handle every possible error situation.
+Run it with an automatic restart mechanism anyway: the exporter still exits on configuration errors, such as a port that is in use or a `--live` home that is not found.
 
-The automatic restart on errors in the live feed will make the exporter recover from most error situations. However, there is a bug in the Tibber service which sometimes fails to report that a home has the live feed feature. To handle this situation, the exporter has a command line option `--live` that can be used to force the exporter to always start the live feed. Therefore, if you have the live feature for your home, it's recommended to run the exporter with `--live <home id>` or set the environment variable `TIBBER_LIVE_ENABLE_HOMES=<home id>` to ensure that the live feed is always started.
+There is a bug in the Tibber service which sometimes fails to report that a home has the live feed feature. To handle this situation, the exporter has a command line option `--live` that can be used to force the exporter to always start the live feed. Therefore, if you have the live feature for your home, it's recommended to run the exporter with `--live <home id>` or set the environment variable `TIBBER_LIVE_ENABLE_HOMES=<home id>` to ensure that the live feed is always started.
+
+### Live feed
+
+The exporter does not exit when the live feed fails. Each websocket session to Tibber ends sooner or later: Tibber restarts its servers, goes silent on a connection that is 24 hours old, or refuses to start the stream for a while. The exporter then opens a new session in the same process, so the price and previous hour/day metrics keep coming and nothing is lost to a restart.
+
+- Before each new session it waits a random time between half and all of a delay that starts at 5 seconds and doubles up to 5 minutes. After a session that delivered data for 10 minutes, the delay starts at 5 seconds again. A long Tibber outage costs about one attempt every 2.5 to 5 minutes.
+- `--live-feed-timeout` (minutes, default 1, values below 1 count as 1) is how long a session may go without a new measurement. Then the session is closed and a new one started. Keep-alives, errors without an end of the subscription and a repeated measurement do not count as new. Tibber sends a measurement about every 10 seconds, so the default notices a dead feed within a minute.
+- The exporter closes a session after 23 hours 55 minutes and starts a new one, before Tibber's 24 hour limit. It waits until the old connection is closed before it opens the next one, so it never holds two connections for one token.
+- A measurement that arrives with an older timestamp than the stored one is skipped, so the exported timestamps never go backwards.
+- The live gauges are not exported once the last measurement is more than 5 minutes old, so a dead feed shows an old value for at most 5 minutes. `tibber_live_connected` is 1 while a session is open and has delivered new data. It drops to 0 when the session ends, at the latest `--live-feed-timeout` after the last new measurement.
+- The log has one line for each session end, with the reason and, if there is one, the error behind it. It does not log each measurement.
+
+If the homes query fails at start-up (Tibber answers 502 or 504 now and then), the exporter retries it with the same delays. The HTTP listener starts before the first call to Tibber, so `/healthz` and `/metrics` answer while Tibber is slow or down. Every HTTP call to Tibber, the websocket handshake included, has a 30 second timeout.
+
+On SIGTERM or SIGINT the exporter ends the subscription, closes the websocket with a close frame and exits with status 0. A second signal ends it at once.
+
+The exporter sends the API token in an `Authorization` header only to `api.tibber.com` and `websocket-api.tibber.com`. The live feed also sends it in its `connection_init` message, which is how Tibber authenticates the websocket, so a `--live-url` on another host gets the token there and not in a header.
+
+#### Health checks and alerts
+
+`/healthz` answers `ok` as soon as the HTTP listener runs. Use it for both the liveness and the readiness probe. It does not depend on Tibber, on purpose: restarting the exporter or taking it out of service does not fix a Tibber outage, and a probe that fails during one turns it into a restart loop or a pod-not-ready alert. Watch Tibber with the metrics instead, for example:
+
+```yaml
+# A feed that flaps (short sessions with long pauses between them) never
+# stays at 0 for long, so look at the share of time it was connected.
+- alert: TibberLiveFeedDown
+  expr: max by (home_id) (avg_over_time(tibber_live_connected[30m])) < 0.5
+  for: 10m
+- alert: TibberLiveDataStale
+  expr: time() - max by (home_id) (tibber_live_last_message_timestamp_seconds) > 600
+  for: 5m
+- alert: TibberHomesNotLoaded
+  expr: absent(tibber_home_info)
+  for: 15m
+```
+
+`time() - tibber_live_last_message_timestamp_seconds` is the age of the live data, and `increase(tibber_live_reconnects_total[1h])` shows why sessions ended.
 
 ### Docker compose
 
@@ -165,6 +203,11 @@ Import the [dashboard](grafana/dashboard.json) or use id `16804` and import from
 | tibber_current                           | Line current                                         | Gauge   |
 | tibber_signal_strength                   | Tibber Pulse signal strength                         | Gauge   |
 | tibber_exporter_build_info               | Tibber exporter build and version info               | Gauge   |
+| tibber_live_connected                    | 1 while a live feed session is open and has delivered new data, else 0 | Gauge   |
+| tibber_live_last_message_timestamp_seconds | Time the last new live measurement was received    | Gauge   |
+| tibber_live_reconnects_total             | Live feed sessions that ended, by `reason`           | Counter |
+
+The `reason` label of `tibber_live_reconnects_total` is one of `read_timeout` (no new measurement for `--live-feed-timeout`, also Tibber's silent cut at 24 hours), `graphql_error` (Tibber sent an error such as "unable to start stream", and no data came after it), `complete` (Tibber ended the subscription without an error), `server_close` (a close frame, for example 1001 "Server restart"), `connection_lost` (EOF or connection reset), `dial_failed` (connect, TLS or websocket handshake failed) and `max_age` (closed by the exporter before the 24 hour limit). Every reason starts at 0, so `increase()` also counts the first one. All the `tibber_live_` metrics have the `home_id` label, like the other metrics.
 
 More information can be found in the [Tibber API documentation](https://developer.tibber.com/docs/reference).
 

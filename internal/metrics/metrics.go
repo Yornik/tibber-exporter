@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -40,14 +41,24 @@ var (
 			"grid_company",
 			"price_area_code",
 		})
+	LiveReconnects = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tibber_live_reconnects_total",
+			Help: "Live feed sessions that ended, by reason",
+		},
+		[]string{
+			"home_id",
+			"reason",
+		})
 )
 
 const maxAge = 5
 
 type MeasurementCollector struct {
-	measurements         *tibber.LiveMeasurement
-	timestampedValues    *tibber.TimestampedValues
-	gaugeValues          *home.GaugeValues
+	home                 *home.Home
+	stale                atomic.Bool // the last Collect found the measurements too old
+	liveConnected        *prometheus.Desc
+	liveLastMessage      *prometheus.Desc
 	consumption          *prometheus.Desc
 	consumptionMin       *prometheus.Desc
 	consumptionMax       *prometheus.Desc
@@ -71,11 +82,21 @@ type MeasurementCollector struct {
 	lastMeterProduction  *prometheus.Desc
 }
 
-func NewMeasurementCollector(homeId string, m *tibber.LiveMeasurement, tv *tibber.TimestampedValues, g *home.GaugeValues) *MeasurementCollector {
+func NewMeasurementCollector(homeId string, h *home.Home) *MeasurementCollector {
 	return &MeasurementCollector{
-		measurements:      m,
-		timestampedValues: tv,
-		gaugeValues:       g,
+		home: h,
+		liveConnected: prometheus.NewDesc(
+			"tibber_live_connected",
+			"1 while a live feed session is open and has delivered new data",
+			nil,
+			prometheus.Labels{"home_id": homeId},
+		),
+		liveLastMessage: prometheus.NewDesc(
+			"tibber_live_last_message_timestamp_seconds",
+			"Time the last new live measurement was received",
+			nil,
+			prometheus.Labels{"home_id": homeId},
+		),
 		consumption: prometheus.NewDesc(
 			"tibber_power_consumption",
 			"Power consumption",
@@ -206,6 +227,8 @@ func NewMeasurementCollector(homeId string, m *tibber.LiveMeasurement, tv *tibbe
 }
 
 func (c *MeasurementCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.liveConnected
+	ch <- c.liveLastMessage
 	ch <- c.consumption
 	ch <- c.consumptionMin
 	ch <- c.consumptionMax
@@ -230,249 +253,264 @@ func (c *MeasurementCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *MeasurementCollector) Collect(ch chan<- prometheus.Metric) {
-	timeDiff := time.Now().Sub(c.measurements.Timestamp)
+	connected, lastMessage := c.home.LiveStatus()
+	up := 0.0
+	if connected {
+		up = 1
+	}
+	ch <- prometheus.MustNewConstMetric(c.liveConnected, prometheus.GaugeValue, up)
+	if !lastMessage.IsZero() {
+		ch <- prometheus.MustNewConstMetric(c.liveLastMessage, prometheus.GaugeValue, float64(lastMessage.UnixNano())/1e9)
+	}
+	measurements, timestampedValues, gaugeValues := c.home.LiveSnapshot()
+	timeDiff := time.Now().Sub(measurements.Timestamp)
 	if timeDiff.Minutes() > maxAge {
-		log.Printf("Measurements too old: %s\n", c.measurements.Timestamp)
+		// Once per stale period: the scrape and the probes collect several
+		// times a minute.
+		if !c.stale.Swap(true) {
+			log.Printf("Measurements too old: %s\n", measurements.Timestamp)
+		}
 		return
 	}
+	c.stale.Store(false)
 	ch <- prometheus.NewMetricWithTimestamp(
-		c.measurements.Timestamp,
+		measurements.Timestamp,
 		prometheus.MustNewConstMetric(
 			c.consumption,
 			prometheus.GaugeValue,
-			c.measurements.Power,
+			measurements.Power,
 		),
 	)
 	ch <- prometheus.NewMetricWithTimestamp(
-		c.measurements.Timestamp,
+		measurements.Timestamp,
 		prometheus.MustNewConstMetric(
 			c.consumptionMin,
 			prometheus.GaugeValue,
-			c.measurements.MinPower,
+			measurements.MinPower,
 		),
 	)
 	ch <- prometheus.NewMetricWithTimestamp(
-		c.measurements.Timestamp,
+		measurements.Timestamp,
 		prometheus.MustNewConstMetric(
 			c.consumptionMax,
 			prometheus.GaugeValue,
-			c.measurements.MaxPower,
+			measurements.MaxPower,
 		),
 	)
 	ch <- prometheus.NewMetricWithTimestamp(
-		c.measurements.Timestamp,
+		measurements.Timestamp,
 		prometheus.MustNewConstMetric(
 			c.consumptionAvg,
 			prometheus.GaugeValue,
-			c.measurements.AveragePower,
+			measurements.AveragePower,
 		),
 	)
 	ch <- prometheus.NewMetricWithTimestamp(
-		c.measurements.Timestamp,
+		measurements.Timestamp,
 		prometheus.MustNewConstMetric(
 			c.consumptionTotal,
 			prometheus.CounterValue,
-			c.measurements.AccumulatedConsumption,
+			measurements.AccumulatedConsumption,
 		),
 	)
 	ch <- prometheus.NewMetricWithTimestamp(
-		c.measurements.Timestamp,
+		measurements.Timestamp,
 		prometheus.MustNewConstMetric(
 			c.costToday,
 			prometheus.GaugeValue,
-			c.gaugeValues.CostToday,
+			gaugeValues.CostToday,
 		),
 	)
 	ch <- prometheus.NewMetricWithTimestamp(
-		c.measurements.Timestamp,
+		measurements.Timestamp,
 		prometheus.MustNewConstMetric(
 			c.costTotal,
 			prometheus.CounterValue,
-			c.measurements.AccumulatedCost,
+			measurements.AccumulatedCost,
 		),
 	)
-	timeDiff = time.Now().Sub(c.timestampedValues.CurrentL1.Timestamp)
+	timeDiff = time.Now().Sub(timestampedValues.CurrentL1.Timestamp)
 	if timeDiff.Minutes() < maxAge {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.timestampedValues.CurrentL1.Timestamp,
+			timestampedValues.CurrentL1.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.current,
 				prometheus.GaugeValue,
-				c.timestampedValues.CurrentL1.Value,
+				timestampedValues.CurrentL1.Value,
 				"1",
 			),
 		)
 	}
-	timeDiff = time.Now().Sub(c.timestampedValues.CurrentL2.Timestamp)
+	timeDiff = time.Now().Sub(timestampedValues.CurrentL2.Timestamp)
 	if timeDiff.Minutes() < maxAge {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.timestampedValues.CurrentL2.Timestamp,
+			timestampedValues.CurrentL2.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.current,
 				prometheus.GaugeValue,
-				c.timestampedValues.CurrentL2.Value,
+				timestampedValues.CurrentL2.Value,
 				"2",
 			),
 		)
 	}
-	timeDiff = time.Now().Sub(c.timestampedValues.CurrentL3.Timestamp)
+	timeDiff = time.Now().Sub(timestampedValues.CurrentL3.Timestamp)
 	if timeDiff.Minutes() < maxAge {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.timestampedValues.CurrentL3.Timestamp,
+			timestampedValues.CurrentL3.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.current,
 				prometheus.GaugeValue,
-				c.timestampedValues.CurrentL3.Value,
+				timestampedValues.CurrentL3.Value,
 				"3",
 			),
 		)
 	}
-	timeDiff = time.Now().Sub(c.timestampedValues.VoltagePhase1.Timestamp)
+	timeDiff = time.Now().Sub(timestampedValues.VoltagePhase1.Timestamp)
 	if timeDiff.Minutes() < maxAge {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.timestampedValues.VoltagePhase1.Timestamp,
+			timestampedValues.VoltagePhase1.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.voltage,
 				prometheus.GaugeValue,
-				c.timestampedValues.VoltagePhase1.Value,
+				timestampedValues.VoltagePhase1.Value,
 				"1",
 			),
 		)
 	}
-	timeDiff = time.Now().Sub(c.timestampedValues.VoltagePhase2.Timestamp)
+	timeDiff = time.Now().Sub(timestampedValues.VoltagePhase2.Timestamp)
 	if timeDiff.Minutes() < maxAge {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.timestampedValues.VoltagePhase2.Timestamp,
+			timestampedValues.VoltagePhase2.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.voltage,
 				prometheus.GaugeValue,
-				c.timestampedValues.VoltagePhase2.Value,
+				timestampedValues.VoltagePhase2.Value,
 				"2",
 			),
 		)
 	}
-	timeDiff = time.Now().Sub(c.timestampedValues.VoltagePhase3.Timestamp)
+	timeDiff = time.Now().Sub(timestampedValues.VoltagePhase3.Timestamp)
 	if timeDiff.Minutes() < maxAge {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.timestampedValues.VoltagePhase3.Timestamp,
+			timestampedValues.VoltagePhase3.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.voltage,
 				prometheus.GaugeValue,
-				c.timestampedValues.VoltagePhase3.Value,
+				timestampedValues.VoltagePhase3.Value,
 				"3",
 			),
 		)
 	}
-	timeDiff = time.Now().Sub(c.timestampedValues.SignalStrength.Timestamp)
+	timeDiff = time.Now().Sub(timestampedValues.SignalStrength.Timestamp)
 	if timeDiff.Minutes() < maxAge {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.timestampedValues.SignalStrength.Timestamp,
+			timestampedValues.SignalStrength.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.signalStrength,
 				prometheus.GaugeValue,
-				c.timestampedValues.SignalStrength.Value,
+				timestampedValues.SignalStrength.Value,
 			),
 		)
 	}
 	ch <- prometheus.NewMetricWithTimestamp(
-		c.measurements.Timestamp,
+		measurements.Timestamp,
 		prometheus.MustNewConstMetric(
 			c.production,
 			prometheus.GaugeValue,
-			c.measurements.PowerProduction,
+			measurements.PowerProduction,
 		),
 	)
 	ch <- prometheus.NewMetricWithTimestamp(
-		c.measurements.Timestamp,
+		measurements.Timestamp,
 		prometheus.MustNewConstMetric(
 			c.productionMin,
 			prometheus.GaugeValue,
-			c.measurements.MinPowerProduction,
+			measurements.MinPowerProduction,
 		),
 	)
 	ch <- prometheus.NewMetricWithTimestamp(
-		c.measurements.Timestamp,
+		measurements.Timestamp,
 		prometheus.MustNewConstMetric(
 			c.productionMax,
 			prometheus.GaugeValue,
-			c.measurements.MaxPowerProduction,
+			measurements.MaxPowerProduction,
 		),
 	)
 	ch <- prometheus.NewMetricWithTimestamp(
-		c.measurements.Timestamp,
+		measurements.Timestamp,
 		prometheus.MustNewConstMetric(
 			c.productionTotal,
 			prometheus.CounterValue,
-			c.measurements.AccumulatedProduction,
+			measurements.AccumulatedProduction,
 		),
 	)
-	if c.gaugeValues.RewardToday != nil {
+	if gaugeValues.RewardToday != nil {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.measurements.Timestamp,
+			measurements.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.rewardToday,
 				prometheus.GaugeValue,
-				*c.gaugeValues.RewardToday,
+				*gaugeValues.RewardToday,
 			),
 		)
 	}
-	if c.measurements.AccumulatedReward != nil {
+	if measurements.AccumulatedReward != nil {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.measurements.Timestamp,
+			measurements.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.rewardTotal,
 				prometheus.CounterValue,
-				*c.measurements.AccumulatedReward,
+				*measurements.AccumulatedReward,
 			),
 		)
 	}
-	timeDiff = time.Now().Sub(c.timestampedValues.PowerReactive.Timestamp)
+	timeDiff = time.Now().Sub(timestampedValues.PowerReactive.Timestamp)
 	if timeDiff.Minutes() < maxAge {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.timestampedValues.PowerReactive.Timestamp,
+			timestampedValues.PowerReactive.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.consumptionReactive,
 				prometheus.GaugeValue,
-				c.timestampedValues.PowerReactive.Value,
+				timestampedValues.PowerReactive.Value,
 			),
 		)
 	}
-	timeDiff = time.Now().Sub(c.timestampedValues.PowerProductionReactive.Timestamp)
+	timeDiff = time.Now().Sub(timestampedValues.PowerProductionReactive.Timestamp)
 	if timeDiff.Minutes() < maxAge {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.timestampedValues.PowerProductionReactive.Timestamp,
+			timestampedValues.PowerProductionReactive.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.productionReactive,
 				prometheus.GaugeValue,
-				c.timestampedValues.PowerProductionReactive.Value,
+				timestampedValues.PowerProductionReactive.Value,
 			),
 		)
 	}
-	timeDiff = time.Now().Sub(c.timestampedValues.PowerFactor.Timestamp)
+	timeDiff = time.Now().Sub(timestampedValues.PowerFactor.Timestamp)
 	if timeDiff.Minutes() < maxAge {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.timestampedValues.PowerFactor.Timestamp,
+			timestampedValues.PowerFactor.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.powerFactor,
 				prometheus.GaugeValue,
-				c.timestampedValues.PowerFactor.Value,
+				timestampedValues.PowerFactor.Value,
 			),
 		)
 	}
 	ch <- prometheus.NewMetricWithTimestamp(
-		c.measurements.Timestamp,
+		measurements.Timestamp,
 		prometheus.MustNewConstMetric(
 			c.lastMeterConsumption,
 			prometheus.CounterValue,
-			c.measurements.LastMeterConsumption,
+			measurements.LastMeterConsumption,
 		),
 	)
 	ch <- prometheus.NewMetricWithTimestamp(
-		c.measurements.Timestamp,
+		measurements.Timestamp,
 		prometheus.MustNewConstMetric(
 			c.lastMeterProduction,
 			prometheus.CounterValue,
-			c.measurements.LastMeterProduction,
+			measurements.LastMeterProduction,
 		),
 	)
 }
@@ -528,35 +566,37 @@ func (c *HomeCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *HomeCollector) Collect(ch chan<- prometheus.Metric) {
-	if c.home.Prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Total != nil {
+	prices := c.home.PricesSnapshot()
+	previousHour, previousDay := c.home.PreviousSnapshot()
+	if prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Total != nil {
 		ch <- prometheus.MustNewConstMetric(
 			c.price,
 			prometheus.GaugeValue,
-			*c.home.Prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Total,
+			*prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Total,
 			"total",
 		)
 	}
-	if c.home.Prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Energy != nil {
+	if prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Energy != nil {
 		ch <- prometheus.MustNewConstMetric(
 			c.price,
 			prometheus.GaugeValue,
-			*c.home.Prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Energy,
+			*prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Energy,
 			"energy",
 		)
 	}
-	if c.home.Prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Tax != nil {
+	if prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Tax != nil {
 		ch <- prometheus.MustNewConstMetric(
 			c.price,
 			prometheus.GaugeValue,
-			*c.home.Prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Tax,
+			*prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Tax,
 			"tax",
 		)
 	}
-	if c.home.Prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Level != nil {
+	if prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Level != nil {
 		ch <- prometheus.MustNewConstMetric(
 			c.priceLevel,
 			prometheus.GaugeValue,
-			float64(tibber.PriceLevel[string(*c.home.Prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Level)]),
+			float64(tibber.PriceLevel[string(*prices.Viewer.Home.CurrentSubscription.PriceInfo.Current.Level)]),
 		)
 	}
 	p := c.home.GetPrices(time.Now().Add(time.Hour))
@@ -593,83 +633,83 @@ func (c *HomeCollector) Collect(ch chan<- prometheus.Metric) {
 			)
 		}
 	}
-	if c.home.PreviousHour.Consumption != nil {
+	if previousHour.Consumption != nil {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.home.PreviousHour.Timestamp,
+			previousHour.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.previousHourConsumption,
 				prometheus.GaugeValue,
-				*c.home.PreviousHour.Consumption,
+				*previousHour.Consumption,
 			),
 		)
 	}
-	if c.home.PreviousHour.Cost != nil {
+	if previousHour.Cost != nil {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.home.PreviousHour.Timestamp,
+			previousHour.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.previousHourCost,
 				prometheus.GaugeValue,
-				*c.home.PreviousHour.Cost,
+				*previousHour.Cost,
 			),
 		)
 	}
-	if c.home.PreviousDay.Consumption != nil {
+	if previousDay.Consumption != nil {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.home.PreviousDay.Timestamp,
+			previousDay.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.previousDayConsumption,
 				prometheus.GaugeValue,
-				*c.home.PreviousDay.Consumption,
+				*previousDay.Consumption,
 			),
 		)
 	}
-	if c.home.PreviousDay.Cost != nil {
+	if previousDay.Cost != nil {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.home.PreviousDay.Timestamp,
+			previousDay.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.previousDayCost,
 				prometheus.GaugeValue,
-				*c.home.PreviousDay.Cost,
+				*previousDay.Cost,
 			),
 		)
 	}
-	if c.home.PreviousHour.Production != nil {
+	if previousHour.Production != nil {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.home.PreviousHour.Timestamp,
+			previousHour.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.previousHourProduction,
 				prometheus.GaugeValue,
-				*c.home.PreviousHour.Production,
+				*previousHour.Production,
 			),
 		)
 	}
-	if c.home.PreviousHour.Profit != nil {
+	if previousHour.Profit != nil {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.home.PreviousHour.Timestamp,
+			previousHour.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.previousHourProfit,
 				prometheus.GaugeValue,
-				*c.home.PreviousHour.Profit,
+				*previousHour.Profit,
 			),
 		)
 	}
-	if c.home.PreviousDay.Production != nil {
+	if previousDay.Production != nil {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.home.PreviousDay.Timestamp,
+			previousDay.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.previousDayProduction,
 				prometheus.GaugeValue,
-				*c.home.PreviousDay.Production,
+				*previousDay.Production,
 			),
 		)
 	}
-	if c.home.PreviousDay.Profit != nil {
+	if previousDay.Profit != nil {
 		ch <- prometheus.NewMetricWithTimestamp(
-			c.home.PreviousDay.Timestamp,
+			previousDay.Timestamp,
 			prometheus.MustNewConstMetric(
 				c.previousDayProfit,
 				prometheus.GaugeValue,
-				*c.home.PreviousDay.Profit,
+				*previousDay.Profit,
 			),
 		)
 	}

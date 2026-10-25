@@ -6,10 +6,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"slices"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/hasura/go-graphql-client"
@@ -17,6 +21,7 @@ import (
 	promver "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/version"
+	"github.com/terjesannum/tibber-exporter/internal/backoff"
 	"github.com/terjesannum/tibber-exporter/internal/home"
 	"github.com/terjesannum/tibber-exporter/internal/metrics"
 	"github.com/terjesannum/tibber-exporter/internal/tibber"
@@ -40,8 +45,15 @@ type (
 	transport  struct {
 		Token     string
 		UserAgent string
+		base      http.RoundTripper // nil means http.DefaultTransport
 	}
 )
+
+// The API token goes in the Authorization header only to these hosts. The live
+// feed also sends it in its connection_init message, to whatever host
+// --live-url or Tibber's websocketSubscriptionUrl names; this list does not
+// cover that.
+var tibberHosts = []string{"api.tibber.com", "websocket-api.tibber.com"}
 
 func (sa *stringArgs) String() string {
 	return fmt.Sprintln(*sa)
@@ -55,13 +67,21 @@ func (sa *stringArgs) Set(s string) error {
 func init() {
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit")
 	flag.StringVar(&token, "token", "", "Tibber API token (default $TIBBER_TOKEN)")
-	flag.IntVar(&liveFeedTimeout, "live-feed-timeout", 1, "Timeout in minutes for live feed")
-	flag.StringVar(&liveUrl, "live-url", "", "Override websocket url for live measurements")
+	flag.IntVar(&liveFeedTimeout, "live-feed-timeout", 1, "Minutes without a new measurement before the live feed reconnects (at least 1)")
+	flag.StringVar(&liveUrl, "live-url", "", "Override websocket url for live measurements (the Authorization header goes only to Tibber hosts)")
 	flag.Var(&liveMeasurements, "live", "Ids of homes to always start live measurements")
 	flag.Var(&disableLiveMeasurements, "disable-live", "Ids of homes to disable live measurements")
 	flag.BoolVar(&disableSubscriptionCheck, "disable-subscription-check", false, "Disable check on active Tibber subscription")
 	flag.StringVar(&listenAddress, "listen-address", ":8080", "Address to listen on for HTTP requests")
+}
+
+// parseFlags is not part of init, so that the tests can run: the testing
+// package registers its flags after init.
+func parseFlags() {
 	flag.Parse()
+	if liveFeedTimeout < 1 {
+		liveFeedTimeout = 1
+	}
 	// Not the flag default: the usage text prints the default.
 	if token == "" {
 		token = os.Getenv("TIBBER_TOKEN")
@@ -99,10 +119,18 @@ func exit(msg string) {
 	os.Exit(1)
 }
 
+// RoundTrip works on a copy: a RoundTripper must not change the caller's request.
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", t.Token))
-	req.Header.Set("User-Agent", t.UserAgent)
-	return http.DefaultTransport.RoundTrip(req)
+	r := req.Clone(req.Context())
+	if slices.Contains(tibberHosts, r.URL.Hostname()) {
+		r.Header.Set("Authorization", fmt.Sprintf("Bearer %s", t.Token))
+	}
+	r.Header.Set("User-Agent", t.UserAgent)
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(r)
 }
 
 func getHomesHandler(w http.ResponseWriter, r *http.Request) {
@@ -110,19 +138,76 @@ func getHomesHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(homesQuery)
 }
 
+// queryHomes retries until Tibber answers, so a Tibber outage at start-up
+// does not restart the exporter. It only fails when ctx ends.
+func queryHomes(ctx context.Context, client *graphql.Client, b *backoff.Backoff) (tibber.HomesQuery, error) {
+	for {
+		var hq tibber.HomesQuery
+		err := client.Query(ctx, &hq, nil)
+		if err == nil {
+			return hq, nil
+		}
+		if ctx.Err() != nil {
+			return hq, ctx.Err()
+		}
+		d := b.Next()
+		log.Printf("Error getting homes: %v. Retrying in %s\n", err, d.Round(time.Millisecond))
+		if !backoff.Sleep(ctx, d) {
+			return hq, ctx.Err()
+		}
+	}
+}
+
+// listen starts the HTTP listener before the first Tibber call, so /healthz
+// and /metrics answer while Tibber is slow or down.
+func listen(addr string) *http.Server {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "Tibber exporter")
+	})
+	// Ready means the exporter serves HTTP. It does not depend on Tibber: a
+	// restart or an unready pod does not fix a Tibber outage. The live feed
+	// metrics show the state of the feed.
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "ok")
+	})
+	http.Handle("/metrics", promhttp.Handler())
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		exit(fmt.Sprintf("Error: %v", err))
+	}
+	log.Printf("Starting http listener %s\n", addr)
+	srv := &http.Server{}
+	go func() {
+		if err := srv.Serve(l); err != http.ErrServerClosed {
+			exit(fmt.Sprintf("Error: %v", err))
+		}
+	}()
+	return srv
+}
+
 func main() {
+	parseFlags()
 	if showVersion {
 		fmt.Printf("%s\n", version.Print("tibber-exporter"))
 		os.Exit(0)
 	}
 	log.Printf("Starting %s\n", userAgent)
-	ctx := context.Background()
-	hc := &http.Client{Transport: &transport{Token: token, UserAgent: userAgent}}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// Without a timeout a stalled connection blocks the price ticker forever.
+	// coder/websocket applies it to the websocket handshake only.
+	hc := &http.Client{Timeout: 30 * time.Second, Transport: &transport{Token: token, UserAgent: userAgent}}
 	client := graphql.NewClient("https://api.tibber.com/v1-beta/gql", hc)
+	prometheus.MustRegister(promver.NewCollector("tibber_exporter"))
+	srv := listen(listenAddress)
+	defer shutdown(srv)
 
-	err := client.Query(ctx, &homesQuery, nil)
+	var err error
+	homesQuery, err = queryHomes(ctx, client, backoff.New())
 	if err != nil {
-		exit(fmt.Sprintf("Error getting homes: %v. Exiting...", err))
+		stop()
+		log.Println("Shutting down")
+		return
 	}
 	http.HandleFunc("/homes", getHomesHandler)
 	wsUrl := homesQuery.Viewer.WebsocketSubscriptionUrl
@@ -131,8 +216,8 @@ func main() {
 		log.Printf("Overiding websocket url with: %s\n", liveUrl)
 		wsUrl = liveUrl
 	}
-	prometheus.MustRegister(promver.NewCollector("tibber_exporter"))
 	var started []string
+	var feeds sync.WaitGroup
 	for _, s := range homesQuery.Viewer.Homes {
 		s := s
 		log.Printf("Found home: %v - %v\n", s.Id, s.AppNickname)
@@ -172,16 +257,28 @@ func main() {
 			if (s.Features.RealTimeConsumptionEnabled || slices.Contains(liveMeasurements, string(s.Id))) && !slices.Contains(disableLiveMeasurements, string(s.Id)) {
 				log.Printf("Starting live measurements monitoring of home %v\n", s.Id)
 				log.Printf("Live feed timeout: %v minute\n", liveFeedTimeout)
-				go h.SubscribeMeasurements(ctx, hc, wsUrl, token)
-				prometheus.MustRegister(metrics.NewMeasurementCollector(string(s.Id), &h.Measurements.LiveMeasurement, &h.TimestampedValues, &h.GaugeValues))
-				started = append(started, string(s.Id))
+				id := string(s.Id)
+				for _, r := range home.EndReasons {
+					metrics.LiveReconnects.WithLabelValues(id, r)
+				}
+				feed := home.LiveFeed{
+					HTTPClient:  hc,
+					Url:         wsUrl,
+					Token:       token,
+					ReadTimeout: time.Duration(liveFeedTimeout) * time.Minute,
+					OnEnd: func(reason string) {
+						metrics.LiveReconnects.WithLabelValues(id, reason).Inc()
+					},
+				}
+				feeds.Go(func() { h.RunLiveFeed(ctx, feed) })
+				prometheus.MustRegister(metrics.NewMeasurementCollector(id, h))
+				started = append(started, id)
 			} else {
 				log.Printf("Live measurements not available for home %v\n", s.Id)
 			}
 			h.UpdatePrices(ctx, client)
 			http.HandleFunc(fmt.Sprintf("/homes/%s/prices", h.Id), h.GetPricesHandler)
 			ticker := time.NewTicker(time.Minute)
-			quit := make(chan struct{})
 			go func() {
 				for {
 					select {
@@ -191,13 +288,7 @@ func main() {
 						}
 						h.UpdatePrevious(ctx, client, tibber.ResolutionHourly)
 						h.UpdatePrevious(ctx, client, tibber.ResolutionDaily)
-						if slices.Contains(started, string(h.Id)) {
-							timeDiff := time.Now().Sub(h.Measurements.LiveMeasurement.Timestamp)
-							if timeDiff.Minutes() > float64(liveFeedTimeout) {
-								exit(fmt.Sprintf("No measurements received for home %s since %s. Exiting...\n", h.Id, h.Measurements.LiveMeasurement.Timestamp))
-							}
-						}
-					case <-quit:
+					case <-ctx.Done():
 						ticker.Stop()
 						return
 					}
@@ -215,11 +306,16 @@ func main() {
 		}
 	}
 
-	log.Printf("Starting http listener %s\n", listenAddress)
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "Tibber exporter")
-	})
-	http.Handle("/metrics", promhttp.Handler())
-	err = http.ListenAndServe(listenAddress, nil)
-	exit(fmt.Sprintf("Error: %v", err))
+	<-ctx.Done()
+	// A second signal now ends the process at once.
+	stop()
+	log.Println("Shutting down")
+	// The live feeds close their websockets before they return.
+	feeds.Wait()
+}
+
+func shutdown(srv *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
 }
