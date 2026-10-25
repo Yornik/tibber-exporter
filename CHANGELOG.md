@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0](https://github.com/Yornik/tibber-exporter/compare/v1.1.2...v1.2.0) (2026-10-25)
+
+
+### Features
+
+* reconnect the live feed in-process instead of exiting ([#31](https://github.com/Yornik/tibber-exporter/issues/31)) ([11ede32](https://github.com/Yornik/tibber-exporter/commit/11ede32547f8f85716280d6eb06d730519cc370e))
+
+
+### Bug Fixes
+
+* **deps:** use the standard library slices package, drop golang.org/x/exp ([#29](https://github.com/Yornik/tibber-exporter/issues/29)) ([3604475](https://github.com/Yornik/tibber-exporter/commit/3604475bfa8fdc99cf8385ee52582b7de16b9eef))
+
 ## [1.1.2](https://github.com/Yornik/tibber-exporter/compare/v1.1.1...v1.1.2) (2026-10-25)
 
 
