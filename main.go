@@ -54,7 +54,7 @@ func (sa *stringArgs) Set(s string) error {
 
 func init() {
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit")
-	flag.StringVar(&token, "token", os.Getenv("TIBBER_TOKEN"), "Tibber API token")
+	flag.StringVar(&token, "token", "", "Tibber API token (default $TIBBER_TOKEN)")
 	flag.IntVar(&liveFeedTimeout, "live-feed-timeout", 1, "Timeout in minutes for live feed")
 	flag.StringVar(&liveUrl, "live-url", "", "Override websocket url for live measurements")
 	flag.Var(&liveMeasurements, "live", "Ids of homes to always start live measurements")
@@ -62,6 +62,10 @@ func init() {
 	flag.BoolVar(&disableSubscriptionCheck, "disable-subscription-check", false, "Disable check on active Tibber subscription")
 	flag.StringVar(&listenAddress, "listen-address", ":8080", "Address to listen on for HTTP requests")
 	flag.Parse()
+	// Not the flag default: the usage text prints the default.
+	if token == "" {
+		token = os.Getenv("TIBBER_TOKEN")
+	}
 	if version.Version == "" {
 		userAgent = "tibber-exporter (https://github.com/terjesannum/tibber-exporter)"
 	} else {
