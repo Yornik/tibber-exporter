@@ -3,7 +3,7 @@ module github.com/terjesannum/tibber-exporter
 go 1.25.0
 
 require (
-	github.com/coder/websocket v1.8.14
+	github.com/coder/websocket v1.8.15
 	github.com/hasura/go-graphql-client v0.16.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/common v0.68.1
