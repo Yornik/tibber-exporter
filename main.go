@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -19,7 +20,6 @@ import (
 	"github.com/terjesannum/tibber-exporter/internal/home"
 	"github.com/terjesannum/tibber-exporter/internal/metrics"
 	"github.com/terjesannum/tibber-exporter/internal/tibber"
-	"golang.org/x/exp/slices"
 )
 
 var (
